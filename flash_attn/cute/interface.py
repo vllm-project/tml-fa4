@@ -1490,6 +1490,7 @@ def flash_attn_varlen_func(
     sfq: Optional[torch.Tensor] = None,
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     del deterministic, score_mod_bwd
     qk_sf_vec_size = None if sfq is None else 32
@@ -1532,6 +1533,7 @@ def flash_attn_varlen_func(
         sfv=sfv,
         qk_sf_vec_size=qk_sf_vec_size,
         v_sf_vec_size=v_sf_vec_size,
+        out=out,
     )
     return (out, lse, logits_max) if return_logits_max else (out, lse)
 

@@ -41,6 +41,7 @@ out, lse = flash_attn_varlen_func(
     max_seqlen_k=max_seqlen_k,
     causal=True,
     return_lse=True,
+    out=preallocated_out,  # optional, same shape/dtype/device as the output
 )
 ```
 
