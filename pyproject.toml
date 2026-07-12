@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=75", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-attn-4-forward"
+dynamic = ["version"]
+description = "Forward-only FlashAttention-4 CuTeDSL kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD 3-Clause License"}
+authors = [
+    {name = "Tri Dao"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "nvidia-cutlass-dsl>=4.4.2",
+    "torch",
+    "einops",
+    "typing_extensions",
+    "apache-tvm-ffi>=0.1.5,<0.2",
+    "torch-c-dlpack-ext",
+    "quack-kernels>=0.4.0",
+]
+
+[project.optional-dependencies]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
+dev = [
+    "pytest",
+    "pytest-xdist",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/thinking-machines-lab/colfax_collab_forward"
+Repository = "https://github.com/thinking-machines-lab/colfax_collab_forward"
+
+[tool.setuptools]
+packages = ["flash_attn", "flash_attn.cute"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "extra == 'cu13'" },
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    "E731",
+    "E741",
+    "F841",
+    "D102",
+]
