@@ -1284,7 +1284,7 @@ def _flash_attn_fwd(
                 current_stream,
                 options="--enable-tvm-ffi",
             )
-        else:
+        elif arch // 10 in [10, 11]:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
                 q_tensor,
@@ -1316,6 +1316,29 @@ def _flash_attn_fwd(
                 current_stream,
                 options="--enable-tvm-ffi",
             )
+        else:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+                num_splits_dynamic_cute,
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
 
     if not is_fake_mode():
         if qv is not None:
@@ -1336,7 +1359,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
             )
-        else:
+        elif arch // 10 in [10, 11]:
             exec_args = [
                 q.detach(),
                 k.detach(),
@@ -1370,6 +1393,28 @@ def _flash_attn_fwd(
                 max_seqlen_q,
             ])
             _flash_attn_fwd.compile_cache[compile_key](*exec_args)
+        else:
+            _flash_attn_fwd.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                out.detach(),
+                lse,
+                softmax_scale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                page_table,
+                window_size_left,
+                window_size_right,
+                learnable_sink,
+                normalized_block_sparse_tensors[:4]
+                if normalized_block_sparse_tensors is not None
+                else None,
+                aux_tensors,
+                num_splits_dynamic,
+            )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
