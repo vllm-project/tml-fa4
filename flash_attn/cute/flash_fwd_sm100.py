@@ -112,6 +112,15 @@ _TUNING_CONFIG = {
     (True, False, 256, False): {"ex2_emu_freq": 14, "ex2_emu_res": 6, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
     (True, True, 256, False): {"ex2_emu_freq": 14, "ex2_emu_res": 6, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
 }
+_FP8_TUNING_CONFIG = {
+    # Currently equal to the base entry for this key; kept as an
+    # explicit pin so the fp8-validated values survive future
+    # retuning of the bf16 table.
+    (False, True, 128, False): {
+        "ex2_emu_freq": 16,
+        "ex2_emu_start_frg": 1,
+    },
+}
 # === END TUNING KNOBS ===
 
 
@@ -481,7 +490,7 @@ class FlashAttentionForwardSm100:
             kv_stage = 3
         v_mma_stage = kv_stage
         # TODO: revisit hard-coded stage counts for mxfp8
-        if self.v_dtype.width == 8:
+        if self.v_dequant:
             kv_stage = 2
             v_mma_stage = (
                 1 if self.has_bias and self.q_stage == 2 else kv_stage
@@ -555,6 +564,14 @@ class FlashAttentionForwardSm100:
         """
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
+        # Plain-fp8 path only: qk-blockscaled Q is also e4m3 but keeps a
+        # bf16 P store and stock softmax scaling, so the fp8 P pre-scale
+        # machinery must not key on dtype width alone.
+        self.fp8_plain = (
+            self.q_dtype.width == 8
+            and not self.qk_blockscaled
+            and not self.v_dequant
+        )
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
@@ -648,14 +665,33 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(not self.qk_blockscaled and not self.v_dequant and self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        if const_expr(mBias is not None and self.bias_dtype != self.v_mma_dtype):
-            raise TypeError(f"Type mismatch: {self.v_mma_dtype} != {self.bias_dtype}")
+        if const_expr(
+            mBias is not None
+            and self.bias_dtype not in (cutlass.BFloat16, cutlass.Float16)
+        ):
+            raise TypeError(
+                f"Attention bias must be BF16 or FP16, got {self.bias_dtype}"
+            )
         if const_expr(
             self.qk_blockscaled and (self.sfk_dtype is None or self.qk_sf_vec_size is None)
         ):
             raise TypeError("SFK dtype and qk_sf_vec_size must be provided when qk_blockscaled.")
         if const_expr(self.qk_blockscaled and self.sfq_dtype != self.sfk_dtype):
             raise TypeError(f"Type mismatch: {self.sfq_dtype} != {self.sfk_dtype}")
+
+        if const_expr(self.fp8_plain):
+            fp8_tune = _FP8_TUNING_CONFIG.get(
+                (
+                    self.use_2cta_instrs,
+                    self.is_causal,
+                    self.head_dim_padded,
+                    self.is_sm103,
+                ),
+                {},
+            )
+            self._tune = {**self._tune, **fp8_tune}
+            if const_expr("ex2_emu_freq" in fp8_tune):
+                self.enable_ex2_emu = fp8_tune["ex2_emu_freq"] > 0
 
         self._setup_attributes()
         
@@ -2653,6 +2689,7 @@ class FlashAttentionForwardSm100:
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
         qk_mma_idesc, pv_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op), sm100_desc.mma_op_to_idesc(pv_mma_op)
+        qk_mma_kind = sm100_utils.tcgen05_mma_kind(qk_mma_op)
         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
         v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
@@ -2693,6 +2730,7 @@ class FlashAttentionForwardSm100:
                     smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
                     zero_init=True,
                     cta_group=self.cta_group_size,
+                    kind=qk_mma_kind,
                 )
                 for stage in range(self.q_stage)
             ]
@@ -3130,7 +3168,12 @@ class FlashAttentionForwardSm100:
         )
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
+            tcgen05.copy.St32x32bOp(
+                tcgen05.copy.Repetition(
+                    8 if const_expr(self.fp8_plain) else 16
+                )
+            ),
+            Float32,
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
@@ -3226,9 +3269,20 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                # fp8 P values are pre-scaled by 2**max_offset, so
+                # lazy-rescale slack is bounded by the e4m3 finite
+                # range: threshold <= log2(448) - max_offset = 0.807.
+                # Past that bound, a row-max jump that stays under the
+                # threshold skips the rescale and clips P; the relative
+                # bias makes such jumps routine.
+                rescale_threshold=(
+                    0.75
+                    if const_expr(self.fp8_plain)
+                    else (8.0 if const_expr(self.q_dtype.width == 16) else 0.0)
+                ),
                 softmax_scale=softmax_scale,
                 store_row_max=self.store_row_max,
+                max_offset=8 if const_expr(self.fp8_plain) else 0,
             )
             softmax.reset()
 
@@ -3568,8 +3622,8 @@ class FlashAttentionForwardSm100:
             bias_si_phase = bias_si_consumer_state.phase
             bias_si_stage = bias_si_consumer_state.index + stage
             pipeline_bias.consumer_wait_w_index_phase(bias_si_stage, bias_si_phase)
-            tBrS = cute.make_tensor(tSrS_t2r.iterator, cute.make_fragment_like(tS2RsBias[None, None, None, 0].layout))
             if const_expr(self.bias_block_size == 128) or tidx < self.bias_block_size:
+                tBrS = cute.make_tensor(tSrS_t2r.iterator, cute.make_fragment_like(tS2RsBias[None, None, None, 0].layout))
                 for i in cutlass.range_constexpr(cute.size(tS2RsBias.shape[2])):
                     tBrS_cur = tBrS[None, 0, i]
                     tS2RsBias_cur = tS2RsBias[None, 0, i, bias_si_stage]
@@ -3737,6 +3791,17 @@ class FlashAttentionForwardSm100:
             cutlass.pipeline.PipelineUserType.Producer, 1
         )
 
+        max_offset = (
+            Float32(8.0)
+            if const_expr(self.fp8_plain)
+            else Float32(0.0)
+        )
+        max_offset_scale = (
+            Float32(256.0)
+            if const_expr(self.fp8_plain)
+            else Float32(1.0)
+        )
+
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -3870,10 +3935,13 @@ class FlashAttentionForwardSm100:
                             if row_max == -Float32.inf:
                                 # It's possible to have an empty row with splitKV.
                                 row_max = sink_val * (LOG2_E / softmax_scale_log2)
-                                row_sum = Float32(1.0)
+                                row_sum = max_offset_scale
                             else:
                                 row_sum += cute.math.exp2(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
+                                    sink_val * LOG2_E
+                                    - row_max * softmax_scale_log2
+                                    + max_offset,
+                                    fastmath=True,
                                 )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
@@ -3978,7 +4046,12 @@ class FlashAttentionForwardSm100:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                        (
+                            row_max * softmax_scale_log2
+                            + cute.math.log2(row_sum, fastmath=True)
+                            - max_offset
+                        )
+                        * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )

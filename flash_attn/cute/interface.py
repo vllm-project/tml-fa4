@@ -385,7 +385,11 @@ def _flash_attn_fwd(
             assert q.dtype in [torch.float16, torch.bfloat16], "Q/K must be float16 or bfloat16"
             assert q.dtype == k.dtype, "Q and K must have the same dtype"
         else:
-            assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+            assert q.dtype in [
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ], "inputs must be float16, bfloat16, or float8_e4m3fn"
             assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
@@ -415,6 +419,14 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
+    if q.dtype == torch.float8_e4m3fn and not blockscaled:
+        assert arch in [100, 103], (
+            "unscaled FP8 attention is only supported on SM100/SM103"
+        )
+        assert not (head_dim == 256 and head_dim_v == 256), (
+            "unscaled FP8 attention does not support head_dim 256 "
+            "(the dedicated hd256 kernel has no fp8 path)"
+        )
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
@@ -425,7 +437,12 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
 
-    out_torch_dtype = torch.bfloat16 if v_blockscaled else (v.dtype if blockscaled else q.dtype)
+    plain_fp8 = q.dtype == torch.float8_e4m3fn and not blockscaled
+    out_torch_dtype = (
+        torch.bfloat16
+        if v_blockscaled or plain_fp8
+        else (v.dtype if blockscaled else q.dtype)
+    )
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)

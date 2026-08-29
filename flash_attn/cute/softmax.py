@@ -170,6 +170,7 @@ class Softmax(ParamsBase):
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
     row_max_true: Optional[cute.Tensor] = None
+    max_offset: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
@@ -177,6 +178,7 @@ class SoftmaxSm100(Softmax):
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
         store_row_max: cutlass.Constexpr[bool] = False,
+        max_offset: cutlass.Constexpr[int] = 0,
     ):
         num_rows = 1
         arch = 100
@@ -194,6 +196,7 @@ class SoftmaxSm100(Softmax):
             softmax_scale,
             rescale_threshold=rescale_threshold,
             row_max_true=row_max_true,
+            max_offset=max_offset,
         )
 
     @cute.jit
@@ -274,11 +277,12 @@ class SoftmaxSm100(Softmax):
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         row_max_scaled = row_max * self.scale_log2
+        bias = Float32(self.max_offset) - row_max_scaled
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
-                (-row_max_scaled, -row_max_scaled),
+                (bias, bias),
             )
 
     @cute.jit
