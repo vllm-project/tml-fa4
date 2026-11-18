@@ -286,6 +286,7 @@ def _flash_attn_fwd(
     gather_kv_indices: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
+    bias_ex2_emu: bool = False,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
@@ -426,6 +427,8 @@ def _flash_attn_fwd(
         softcap = None
 
     out_torch_dtype = torch.bfloat16 if v_blockscaled else (v.dtype if blockscaled else q.dtype)
+    if out is not None and out.dtype == torch.float32:
+        out_torch_dtype = torch.float32
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -856,10 +859,16 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
             )
+    elif bias is not None:
+        # Already sheared as ShearingBias writes it, rows padded by tile_m.
+        rel_extent_padded = bias.shape[-1]
+        rel_extent = rel_extent_padded - 256
+        assert rel_extent % 128 == 0 and tile_m == 128 and tile_n == 128
+        assert cu_seqlens_q is not None
+        assert bias.shape == (total_q + tile_m, num_head, rel_extent_padded)
     else:
         rel_extent = 0
         rel_extent_padded = 0
-        bias = None
 
     # if bias is not None:
     #     rel_extent_padded = bias.shape[-1]
@@ -985,6 +994,7 @@ def _flash_attn_fwd(
 
     compile_key = (
         dtype,
+        out_torch_dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -1025,6 +1035,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         bias is not None,
+        bias_ex2_emu,
         tile_bias,
         rel_extent,
         has_scheduler_metadata,
@@ -1228,6 +1239,7 @@ def _flash_attn_fwd(
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
                     has_bias=bias is not None,
+                    bias_ex2_emu=bias_ex2_emu,
                     rel_extent_padded=rel_extent_padded,
                     has_scheduler_metadata=has_scheduler_metadata,
                     seqlen_k_per_split=seqlen_k_per_split,
@@ -1536,6 +1548,7 @@ def flash_attn_varlen_func(
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    bias_ex2_emu: bool = False,
 ):
     del deterministic, score_mod_bwd
     qk_sf_vec_size = None if sfq is None else 32
@@ -1569,6 +1582,7 @@ def flash_attn_varlen_func(
         gather_kv_indices=gather_kv_indices,
         return_logits_max=return_logits_max,
         rel_bias=rel_bias,
+        bias_ex2_emu=bias_ex2_emu,
         scheduler_metadata=scheduler_metadata,
         seqlen_k_per_split=seqlen_k_per_split,
         disable_scheduler_metadata=disable_scheduler_metadata,
