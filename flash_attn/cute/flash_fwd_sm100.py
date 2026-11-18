@@ -142,6 +142,7 @@ class FlashAttentionForwardSm100:
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
         has_bias: bool = False,
+        bias_ex2_emu: bool = False,
         rel_extent_padded: int = 128,
         has_scheduler_metadata: bool = False,
         seqlen_k_per_split: Optional[int] = None,
@@ -151,6 +152,9 @@ class FlashAttentionForwardSm100:
         kv_sf_interleaved: bool = False,
     ):
         self.has_bias = has_bias
+        # Run ex2 FFMA emulation on unmasked sheared-bias blocks, matching a
+        # score_mod reference that only disables it where mask_fn applies.
+        self.bias_ex2_emu = has_bias and bias_ex2_emu
         self.rel_extent_padded = rel_extent_padded
         assert rel_extent_padded % n_block_size == 0
         self.bias_n_max = rel_extent_padded//n_block_size if has_bias else 0
@@ -3364,6 +3368,13 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.is_causal or self.is_local or self.has_bias):
                         if const_expr(self.has_bias):
                             n_block_min_causal_local_mask = max(n_block_max + 1 - num_bias_loads, n_block_min)
+                            if const_expr(self.bias_ex2_emu):
+                                n_block_min_bias_emu_off = block_info.get_n_block_min_causal_local_mask(
+                                    seqlen, m_block, n_block_min
+                                )
+                                n_block_left_bias_emu_off = block_info.get_n_block_min_before_local_mask(
+                                    seqlen, m_block, n_block_min
+                                )
                         else:
                             n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                                 seqlen, m_block, n_block_min
@@ -3385,6 +3396,12 @@ class FlashAttentionForwardSm100:
                                 mask_fn=partial(mask_fn, mask_seqlen=False) if const_expr(not self.has_bias) else None,
                                 # mask_fn=partial(mask_fn, mask_seqlen=False),
                                 apply_bias=True,
+                                bias_emu_off=Boolean(
+                                    n_block >= n_block_min_bias_emu_off
+                                    or n_block < n_block_left_bias_emu_off
+                                )
+                                if const_expr(self.bias_ex2_emu)
+                                else None,
                                 bias_si_consumer_state=bias_si_consumer_state,
                             )
                         n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
@@ -3523,6 +3540,7 @@ class FlashAttentionForwardSm100:
         tS2RsBias: Optional[cute.Tensor] = None, 
         bias_s2r_thr_copy: Optional[cute.CopyAtom] = None,
         apply_bias: bool = False,
+        bias_emu_off: Optional[Boolean] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
         bias_si_consumer_state: Optional[pipeline.PipelineState] = None,
         pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
@@ -3632,12 +3650,28 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_mma_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None and not apply_bias) else 0,
-            ex2_emu_start_frg=self.ex2_emu_start_frg,
-        )
+        if const_expr(self.bias_ex2_emu and mask_fn is None and apply_bias):
+            if bias_emu_off:
+                softmax.apply_exp2_convert(
+                    tSrS_t2r,
+                    tSrP_r2t,
+                    ex2_emu_freq=0,
+                    ex2_emu_start_frg=self.ex2_emu_start_frg,
+                )
+            else:
+                softmax.apply_exp2_convert(
+                    tSrS_t2r,
+                    tSrP_r2t,
+                    ex2_emu_freq=self.ex2_emu_freq,
+                    ex2_emu_start_frg=self.ex2_emu_start_frg,
+                )
+        else:
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None and not apply_bias) else 0,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
+            )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
