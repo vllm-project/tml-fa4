@@ -56,6 +56,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        has_bias: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -98,6 +99,7 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.has_bias = has_bias
         self.qk_acc_dtype = Float32
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -291,6 +293,22 @@ class FlashAttentionForwardBase:
         self.gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async_copy, tV_layout, vQKV_layout)
         # gmem_tiled_copy_O: tiled copy for O store
         self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
+        if self.has_bias:
+            # bias tile (tile_m, tile_n): same async atom/vec as K, cols major
+            tBias_dim_1 = self.tile_n // async_copy_elems
+            tBias_layout = cute.make_ordered_layout(
+                (self.num_producer_threads // tBias_dim_1, tBias_dim_1),
+                order=(1, 0),
+            )
+            self.sBias_layout = cute.make_ordered_layout(
+                (self.tile_m, self.tile_n), order=(1, 0)
+            )
+            self.gmem_tiled_copy_Bias = cute.make_tiled_copy_tv(
+                atom_async_copy, tBias_layout, vQKV_layout
+            )
+        else:
+            self.sBias_layout = None
+            self.gmem_tiled_copy_Bias = None
 
     def _get_smem_layout_atom(self):
         raise NotImplementedError()
@@ -599,6 +617,20 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
 
+        if const_expr(self.has_bias):
+            sBias_struct = cute.struct.Align[
+                cute.struct.MemRange[self.dtype, cute.cosize(self.sBias_layout)], 1024
+            ]
+
+            @cute.struct
+            class SharedStorageQKVBias:
+                sV: sV_struct
+                sQ: sQ_struct
+                sK: sK_struct
+                sBias: sBias_struct
+
+            return SharedStorageQKVBias
+
         @cute.struct
         class SharedStorageQKV:
             sV: sV_struct
@@ -632,6 +664,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
+        mBias: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -668,6 +701,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        if const_expr(mBias is not None):
+            # (b, s, h, padded) -> (s, padded, h, b)
+            # varlen: (total_q, h, padded) -> (total_q, padded, h)
+            Bias_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+            mBias = cute.make_tensor(
+                assume_tensor_aligned(mBias).iterator,
+                cute.select(mBias.layout, mode=Bias_layout_transpose),
+            )
         # TileScheduler for varlen, simple grid for non-varlen
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -696,7 +737,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        # With a bias the scale is applied to the scores before the bias is added
+        # (as with a score_mod), so it is not folded into the exp2 scale.
+        scale_mod = (
+            self.score_mod if self.score_mod is not None else (True if self.has_bias else None)
+        )
+        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
+            softmax_scale, scale_mod
+        )
         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors)
 
         self.kernel(
@@ -729,6 +777,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
+            mBias,
+            self.sBias_layout,
+            self.gmem_tiled_copy_Bias,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -768,6 +819,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
+        mBias: Optional[cute.Tensor] = None,
+        sBias_layout=None,
+        gmem_tiled_copy_Bias=None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -819,6 +873,30 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         else:
             mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
             mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
+        if const_expr(mBias is not None):
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mBias_sliced = mBias[None, None, num_head, batch_size]
+            else:
+                mBias_sliced = cute.domain_offset(
+                    (seqlen.offset_q, 0), mBias[None, None, num_head]
+                )
+            # The head slice starts at num_head * padded elements; padded is a
+            # multiple of 128, so it is 16B-aligned, but CuTe cannot prove it.
+            _bias_ptr = cute.make_ptr(
+                mBias.element_type,
+                mBias_sliced.iterator.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            mBias_cur = assume_tensor_aligned(cute.make_tensor(
+                _bias_ptr,
+                cute.make_layout(
+                    mBias_sliced.shape,
+                    stride=mBias_sliced.layout.stride,
+                ),
+            ))
+        else:
+            mBias_cur = None
         gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
         gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
         gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
@@ -830,6 +908,52 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sK_layout)
+        if const_expr(self.has_bias and mBias is not None):
+            sBias = storage.sBias.get_tensor(sBias_layout)
+            padded_bias = mBias_cur.shape[1]
+            # The sheared layout shifts columns by a multiple of 128, so the
+            # shift is applied to the bias tile index (n + bias_tile_shift).
+            gBias_tiles = cute.local_tile(
+                mBias_cur, (self.tile_m, self.tile_n), (m_block, None)
+            )
+            gmem_thr_copy_Bias = gmem_tiled_copy_Bias.get_slice(tidx)
+            tBgBias = gmem_thr_copy_Bias.partition_S(gBias_tiles)
+            tBsBias = gmem_thr_copy_Bias.partition_D(sBias)
+            # ShearingBias writes the sheared layout in 128x128 blocks
+            # (shearing_bias.py builds BlockInfo(128, 128)), so the column shift is
+            # derived from n_block_max at 128 granularity, not at this kernel's
+            # tile_n (64 on SM80). Using n_block_max (not m_block + 1) keeps it
+            # correct when seqlen_q != seqlen_k (chunked prefill, decode).
+            bias_block_info = BlockInfo(
+                128,
+                128,
+                self.is_causal,
+                self.is_local,
+                False,  # is_split_kv
+                window_size_left,
+                window_size_right,
+                qhead_per_kvhead_packgqa=(
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                ),
+            )
+            _, n_block_max_128 = bias_block_info.get_n_block_min_max(
+                seqlen, m_block
+            )
+            bias_tile_shift = (
+                padded_bias // self.tile_n
+                - (128 * n_block_max_128) // self.tile_n
+            )
+            bias_k_min_tile = -bias_tile_shift
+            # Upper bound on the shifted tile: the bias copy is unpredicated, and on
+            # an empty varlen tile (seqlen_k == 0) n_block_max_128 == 0 while the
+            # mainloop still runs n_block == 0, which would read past the buffer.
+            bias_k_max_tile = (128 * n_block_max_128) // self.tile_n
+        else:
+            sBias = None
+            tBgBias = None
+            tBsBias = None
+            bias_k_min_tile = Int32(0)
+            bias_k_max_tile = Int32(0)
         if const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout)
         else:
@@ -936,6 +1060,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mma_params=mma_params,
             smem_copy_params=smem_copy_params,
             softmax=softmax,
+            sBias=sBias,
+            tBgBias=tBgBias,
+            tBsBias=tBsBias,
+            bias_k_min_tile=bias_k_min_tile,
+            bias_k_max_tile=bias_k_max_tile,
+            bias_tile_shift=bias_tile_shift,
+            gmem_tiled_copy_Bias=gmem_tiled_copy_Bias,
             load_K=load_K,
             load_V=load_V,
             score_mod=self.score_mod,
@@ -1096,6 +1227,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        sBias=None,
+        tBgBias=None,
+        tBsBias=None,
+        bias_k_min_tile=None,
+        bias_k_max_tile=None,
+        bias_tile_shift=None,
+        gmem_tiled_copy_Bias=None,
     ):
         """Compute one n_block of S/O.
 
@@ -1123,6 +1261,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
             cute.arch.cp_async_commit_group()
 
+        if const_expr(self.has_bias and sBias is not None):
+            # Copy only tiles inside the sheared buffer (see bias_k_max_tile).
+            if n_block >= bias_k_min_tile and n_block < bias_k_max_tile:
+                cute.copy(
+                    gmem_tiled_copy_Bias,
+                    tBgBias[None, None, None, n_block + bias_tile_shift],
+                    tBsBias,
+                )
         load_V_next()
         sm80_utils.gemm(
             mma_params.thr_mma_qk,
@@ -1163,6 +1309,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(self.num_stages == 1):
             sync()
             load_K_next()
+        if const_expr(self.has_bias and sBias is not None):
+            if const_expr(self.num_stages != 1):
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+            self.apply_rel_bias_smem(
+                mma_params.thr_mma_qk,
+                acc_S,
+                softmax.softmax_scale,
+                sBias,
+                # Tiles whose copy was skipped get no bias (scale only).
+                n_block >= bias_k_min_tile and n_block < bias_k_max_tile,
+            )
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
@@ -1186,6 +1344,30 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
+    @cute.jit
+    def apply_rel_bias_smem(
+        self,
+        thr_mma_qk,
+        acc_S,
+        softmax_scale,
+        sBias,
+        tile_valid,
+    ):
+        """acc = acc*scale + sBias[frag coords]; scale-only if tile invalid
+        (fully out-of-range tile => bias 0 everywhere, contract-guaranteed
+        never partial since k_min % tile_n == 0)."""
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        tScS = thr_mma_qk.partition_C(cS)
+        n_vals = cutlass.const_expr(cute.size(acc_S.shape))
+        if tile_valid:
+            for i in cutlass.range(0, n_vals, 1, unroll_full=True):
+                acc_S[i] = acc_S[i] * softmax_scale + Float32(
+                    sBias[(tScS[i][0], tScS[i][1])]
+                )
+        else:
+            for i in cutlass.range(0, n_vals, 1, unroll_full=True):
+                acc_S[i] = acc_S[i] * softmax_scale
+
     @cute.jit
     def apply_score_mod(
         self,
