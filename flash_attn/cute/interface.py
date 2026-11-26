@@ -494,6 +494,12 @@ def _flash_attn_fwd(
         pack_gqa = False
     if arch // 10 in [10, 11] and (128 % qhead_per_kvhead != 0):
         pack_gqa = False
+    if arch // 10 == 8 and rel_bias is not None:
+        # The SM80 kernel reads the sheared bias per 128-row query tile. With
+        # pack_gqa, ShearingBias packs qhead_per_kvhead heads into those rows, so
+        # writer and reader would disagree on the shear offset whenever
+        # (seqlen_k - seqlen_q) % 128 != 0.
+        pack_gqa = False
     
     if pack_gqa:
         q_sf_interleaved = False
@@ -673,7 +679,8 @@ def _flash_attn_fwd(
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
         assert tile_m == 128
-        assert tile_n == 128
+        # SM80 tiles N at 64; its kernel reads the same 128-column shear.
+        assert tile_n == 128 or arch // 10 == 8
         assert (
             causal
             or window_size_left is None
@@ -863,7 +870,8 @@ def _flash_attn_fwd(
         # Already sheared as ShearingBias writes it, rows padded by tile_m.
         rel_extent_padded = bias.shape[-1]
         rel_extent = rel_extent_padded - 256
-        assert rel_extent % 128 == 0 and tile_m == 128 and tile_n == 128
+        assert rel_extent % 128 == 0 and tile_m == 128
+        assert tile_n == 128 or arch // 10 == 8
         assert cu_seqlens_q is not None
         assert bias.shape == (total_q + tile_m, num_head, rel_extent_padded)
     else:
@@ -1142,6 +1150,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                has_bias=bias is not None,
             )
         elif arch // 10 == 9:
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -1348,6 +1357,12 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 cute_aux_tensors,
                 num_splits_dynamic_cute,
+                # SM80 takes the sheared bias as an extra argument (16B-aligned rows).
+                *(
+                    [to_cute_tensor(bias, assumed_align=16) if bias is not None else None]
+                    if arch // 10 == 8
+                    else []
+                ),
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1426,6 +1441,7 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
                 num_splits_dynamic,
+                *([bias] if arch // 10 == 8 else []),
             )
     if is_split_kv:
         _flash_attn_fwd_combine(
